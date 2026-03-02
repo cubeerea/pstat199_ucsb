@@ -1,0 +1,18 @@
+torch
+torchvision
+torchmetrics
+transformers
+diffusers
+blobfile
+datasets
+black
+pre-commit
+scikit-learn
+pandas
+wandb
+numpy<2 # compatibility with hydra-core
+pytest
+lm-eval
+hydra-core
+pandas
+sentencepiece
