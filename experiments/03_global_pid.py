@@ -12,6 +12,7 @@ Outputs:
 Usage:
   python experiments/03_global_pid.py --small
   python experiments/03_global_pid.py
+  python experiments/03_global_pid.py --kp 1.0 --ki 0.05 --kd 0.0 --scale 0.5
 """
 import argparse
 import json
@@ -33,7 +34,6 @@ ARTIFACTS_DIR = Path("artifacts")
 RESULTS_DIR.mkdir(exist_ok=True)
 
 MODEL_ID = "google/gemma-2-2b-it"
-KP, KI, KD = 0.9, 0.01, 0.01
 
 
 def generate_completions(model, tokenizer, instructions, fwd_hooks, batch_size, max_new_tokens, device):
@@ -61,14 +61,32 @@ def generate_completions(model, tokenizer, instructions, fwd_hooks, batch_size, 
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--small", action="store_true")
-    parser.add_argument("--device", default=None)
+    parser = argparse.ArgumentParser(
+        description="Global PID steering on Gemma-2-2B-it (Hank's contribution)."
+    )
+    parser.add_argument("--small", action="store_true",
+                        help="Shorthand for --n-test 10 --batch-size 4 --max-new-tokens 64")
+    parser.add_argument("--device", default=None,
+                        help="Override device (e.g. cuda, cuda:0, mps, cpu)")
+    parser.add_argument("--n-test", type=int, default=None,
+                        help="Number of test prompts (default: all 104)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Generation batch size (default: 16)")
+    parser.add_argument("--max-new-tokens", type=int, default=None,
+                        help="Max tokens to generate per prompt (default: 256)")
+    parser.add_argument("--kp", type=float, default=0.9,
+                        help="Proportional gain (default: 0.9)")
+    parser.add_argument("--ki", type=float, default=0.01,
+                        help="Integral gain (default: 0.01)")
+    parser.add_argument("--kd", type=float, default=0.01,
+                        help="Derivative gain (default: 0.01)")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Steering vector scale / alpha (default: 1.0)")
     args = parser.parse_args()
 
-    n_test = 10 if args.small else None
-    max_new_tokens = 64 if args.small else 256
-    batch_size = 4 if args.small else 16
+    n_test = args.n_test if args.n_test is not None else (10 if args.small else None)
+    max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else (64 if args.small else 256)
+    batch_size = args.batch_size if args.batch_size is not None else (4 if args.small else 16)
 
     if args.device:
         device = args.device
@@ -79,13 +97,16 @@ def main():
     else:
         device = "cpu"
 
-    print(f"Device: {device} | n_test: {n_test or 'all'} | model: {MODEL_ID}")
+    print(f"Device: {device} | n_test: {n_test or 'all'} | "
+          f"Kp={args.kp} Ki={args.ki} Kd={args.kd} scale={args.scale} | model: {MODEL_ID}")
 
-    # Load global vector and window
     global_path = ARTIFACTS_DIR / "refusal_vector_global.pt"
     window_path = ARTIFACTS_DIR / "persistence_window.json"
     if not global_path.exists():
-        raise FileNotFoundError(f"{global_path} not found. Run 01_persistence_verification.py first.")
+        raise FileNotFoundError(
+            f"{global_path} not found. Run 01_persistence_verification.py first "
+            f"(needs a non-empty persistence window)."
+        )
     r_bar = torch.load(global_path).to(device)
     with open(window_path) as f:
         window_data = json.load(f)
@@ -101,16 +122,13 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="left")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, dtype=torch.float16, device_map=device
-    )
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float16, device_map=device)
     model.eval()
     model.requires_grad_(False)
 
     module_dict = dict(model.named_modules())
     results = {}
 
-    # Load per-layer PID baseline for comparison
     baseline_path = RESULTS_DIR / "baseline_perlayer_pid_asr.json"
     if baseline_path.exists():
         with open(baseline_path) as f:
@@ -120,13 +138,13 @@ def main():
 
     # ── Global PID ────────────────────────────────────────────────────────────
     print("\n[1/2] Global PID")
-    ctrl = GlobalPIDController(r_bar=r_bar, kp=KP, ki=KI, kd=KD, window=window)
+    ctrl = GlobalPIDController(r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window)
     steering_dirs = ctrl.precompute_steering_dirs()
 
     fwd_hooks = [
         (
             module_dict[f"model.layers.{k}.post_attention_layernorm"],
-            get_actadd_output_hook(steering_dirs[k].to(device), scale=1.0),
+            get_actadd_output_hook(steering_dirs[k].to(device), scale=args.scale),
         )
         for k in window
         if f"model.layers.{k}.post_attention_layernorm" in module_dict
@@ -135,18 +153,21 @@ def main():
         model, tokenizer, harmful_test, fwd_hooks, batch_size, max_new_tokens, device
     )
     asr = compute_asr(completions)
-    results["global_pid"] = {**asr, "kp": KP, "ki": KI, "kd": KD, "window": window}
+    results["global_pid"] = {**asr, "kp": args.kp, "ki": args.ki, "kd": args.kd,
+                              "scale": args.scale, "window": window}
     print(f"  Global PID ASR: {asr['asr']:.3f} ({asr['n_success']}/{asr['n_total']})")
 
-    # ── Global PID + Anti-windup ───────────────────────────────────────────────
+    # ── Global PID + Anti-windup ──────────────────────────────────────────────
     print("\n[2/2] Global PID + Anti-windup")
-    ctrl_aw = GlobalPIDControllerAntiWindup(r_bar=r_bar, kp=KP, ki=KI, kd=KD, window=window)
+    ctrl_aw = GlobalPIDControllerAntiWindup(
+        r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window
+    )
     steering_dirs_aw = ctrl_aw.precompute_steering_dirs()
 
     fwd_hooks_aw = [
         (
             module_dict[f"model.layers.{k}.post_attention_layernorm"],
-            get_actadd_output_hook(steering_dirs_aw[k].to(device), scale=1.0),
+            get_actadd_output_hook(steering_dirs_aw[k].to(device), scale=args.scale),
         )
         for k in window
         if f"model.layers.{k}.post_attention_layernorm" in module_dict
@@ -155,10 +176,10 @@ def main():
         model, tokenizer, harmful_test, fwd_hooks_aw, batch_size, max_new_tokens, device
     )
     asr_aw = compute_asr(completions_aw)
-    results["global_pid_antiwindup"] = {**asr_aw, "kp": KP, "ki": KI, "kd": KD, "window": window}
+    results["global_pid_antiwindup"] = {**asr_aw, "kp": args.kp, "ki": args.ki, "kd": args.kd,
+                                         "scale": args.scale, "window": window}
     print(f"  Global PID + AW ASR: {asr_aw['asr']:.3f} ({asr_aw['n_success']}/{asr_aw['n_total']})")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\nAll conditions:")
     for cond, res in results.items():
         if res:

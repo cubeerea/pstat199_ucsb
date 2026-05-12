@@ -8,8 +8,9 @@ Outputs:
   results/baseline_perlayer_pid_asr.json
 
 Usage:
-  python experiments/02_baseline_perlayer_pid.py --small   # 10 prompts
-  python experiments/02_baseline_perlayer_pid.py           # full 104 test prompts
+  python experiments/02_baseline_perlayer_pid.py --small
+  python experiments/02_baseline_perlayer_pid.py
+  python experiments/02_baseline_perlayer_pid.py --kp 1.0 --ki 0.05 --kd 0.0 --scale 1.5
 """
 import argparse
 import json
@@ -31,10 +32,6 @@ ARTIFACTS_DIR = Path("artifacts")
 RESULTS_DIR.mkdir(exist_ok=True)
 
 MODEL_ID = "google/gemma-2-2b-it"
-
-# PID gains — Path A defaults from angular_steering.ipynb Cell 47
-# Escalated to Hank for confirmation; see notes/gains_gemma2.md
-KP, KI, KD = 0.9, 0.01, 0.01
 
 
 def generate_completions(model, tokenizer, instructions, fwd_hooks, batch_size, max_new_tokens, device):
@@ -62,14 +59,32 @@ def generate_completions(model, tokenizer, instructions, fwd_hooks, batch_size, 
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--small", action="store_true", help="Use 10 test prompts")
-    parser.add_argument("--device", default=None)
+    parser = argparse.ArgumentParser(
+        description="Per-layer PID steering baseline on Gemma-2-2B-it."
+    )
+    parser.add_argument("--small", action="store_true",
+                        help="Shorthand for --n-test 10 --batch-size 4 --max-new-tokens 64")
+    parser.add_argument("--device", default=None,
+                        help="Override device (e.g. cuda, cuda:0, mps, cpu)")
+    parser.add_argument("--n-test", type=int, default=None,
+                        help="Number of test prompts (default: all 104)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Generation batch size (default: 16)")
+    parser.add_argument("--max-new-tokens", type=int, default=None,
+                        help="Max tokens to generate per prompt (default: 256)")
+    parser.add_argument("--kp", type=float, default=0.9,
+                        help="Proportional gain (default: 0.9)")
+    parser.add_argument("--ki", type=float, default=0.01,
+                        help="Integral gain (default: 0.01)")
+    parser.add_argument("--kd", type=float, default=0.01,
+                        help="Derivative gain (default: 0.01)")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Steering vector scale / alpha (default: 1.0)")
     args = parser.parse_args()
 
-    n_test = 10 if args.small else None
-    max_new_tokens = 64 if args.small else 256
-    batch_size = 4 if args.small else 16
+    n_test = args.n_test if args.n_test is not None else (10 if args.small else None)
+    max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else (64 if args.small else 256)
+    batch_size = args.batch_size if args.batch_size is not None else (4 if args.small else 16)
 
     if args.device:
         device = args.device
@@ -80,9 +95,9 @@ def main():
     else:
         device = "cpu"
 
-    print(f"Device: {device} | n_test: {n_test or 'all'} | model: {MODEL_ID}")
+    print(f"Device: {device} | n_test: {n_test or 'all'} | "
+          f"Kp={args.kp} Ki={args.ki} Kd={args.kd} scale={args.scale} | model: {MODEL_ID}")
 
-    # Load pre-computed DIM directions
     per_layer_path = ARTIFACTS_DIR / "refusal_vectors_per_layer.pt"
     if not per_layer_path.exists():
         raise FileNotFoundError(
@@ -98,15 +113,12 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="left")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, dtype=torch.float16, device_map=device
-    )
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float16, device_map=device)
     model.eval()
     model.requires_grad_(False)
 
     module_dict = dict(model.named_modules())
     n_layers = model.config.num_hidden_layers
-
     results = {}
 
     # ── Condition 1: No steering ───────────────────────────────────────────────
@@ -121,13 +133,13 @@ def main():
 
     # ── Condition 2: Per-layer PID steering ───────────────────────────────────
     print("\n[2/2] Per-layer PID steering")
-    controller = PerLayerPIDController(ref_dirs, kp=KP, ki=KI, kd=KD)
+    controller = PerLayerPIDController(ref_dirs, kp=args.kp, ki=args.ki, kd=args.kd)
     steering_dirs = controller.steering_dirs
 
     fwd_hooks_pid = [
         (
             module_dict[f"model.layers.{k}.post_attention_layernorm"],
-            get_actadd_output_hook(steering_dirs[k].to(device), scale=1.0),
+            get_actadd_output_hook(steering_dirs[k].to(device), scale=args.scale),
         )
         for k in range(n_layers)
         if k in steering_dirs
@@ -137,13 +149,13 @@ def main():
         max_new_tokens=max_new_tokens, device=device
     )
     asr_pid = compute_asr(completions_pid)
-    results["perlayer_pid"] = {**asr_pid, "kp": KP, "ki": KI, "kd": KD}
+    results["perlayer_pid"] = {**asr_pid, "kp": args.kp, "ki": args.ki, "kd": args.kd, "scale": args.scale}
     print(f"  Per-layer PID ASR: {asr_pid['asr']:.3f} ({asr_pid['n_success']}/{asr_pid['n_total']})")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\nDirect-attack ASR summary:")
     print(f"  No steering:   {results['no_steering']['asr']:.3f}")
-    print(f"  Per-layer PID: {results['perlayer_pid']['asr']:.3f}  (Kp={KP}, Ki={KI}, Kd={KD})")
+    print(f"  Per-layer PID: {results['perlayer_pid']['asr']:.3f}  "
+          f"(Kp={args.kp}, Ki={args.ki}, Kd={args.kd}, scale={args.scale})")
 
     out_path = RESULTS_DIR / "baseline_perlayer_pid_asr.json"
     with open(out_path, "w") as f:
