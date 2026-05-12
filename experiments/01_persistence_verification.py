@@ -69,6 +69,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--small", action="store_true", help="Use 10 prompts (fast, CPU)")
     parser.add_argument("--device", default=None, help="Override device (e.g. cuda:0, mps, cpu)")
+    parser.add_argument("--threshold", type=float, default=COSINE_THRESHOLD,
+                        help="Cosine threshold for window identification (default: 0.8)")
     args = parser.parse_args()
 
     n_train = 10 if args.small else 256
@@ -130,6 +132,30 @@ def main():
 
     cosine_matrix = (stack_normed @ stack_normed.T).float().cpu().numpy()
 
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+    # Adjacent-layer cosines (most likely to be high — lower bound on persistence)
+    adj = [cosine_matrix[i, i + 1] for i in range(len(layers) - 1)]
+    print(f"\nCosine matrix diagnostics (n_layers={len(layers)}):")
+    print(f"  Overall  — min: {cosine_matrix[~np.eye(len(layers), dtype=bool)].min():.3f} "
+          f"| mean: {cosine_matrix[~np.eye(len(layers), dtype=bool)].mean():.3f} "
+          f"| max: {cosine_matrix[~np.eye(len(layers), dtype=bool)].max():.3f}")
+    print(f"  Adjacent — min: {min(adj):.3f} | mean: {np.mean(adj):.3f} | max: {max(adj):.3f}")
+    print(f"  Adjacent cosines by layer pair:")
+    for i, c in enumerate(adj):
+        bar = "#" * int(max(0, c) * 20)
+        print(f"    L{i:2d}–L{i+1:2d}: {c:+.3f}  {bar}")
+
+    # Best window at multiple thresholds so Hank can pick
+    print(f"\n  Best window at various thresholds:")
+    for t in [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3]:
+        w = identify_persistence_window(cosine_matrix, threshold=t)
+        label = f"L{w[0]}–L{w[-1]} (width {len(w)})" if w else "none"
+        print(f"    threshold={t:.1f}: {label}")
+
+    # Save raw matrix for offline inspection
+    np.save(ARTIFACTS_DIR / "cosine_matrix.npy", cosine_matrix)
+    print(f"\n  Raw matrix saved: {ARTIFACTS_DIR / 'cosine_matrix.npy'}")
+
     # ── Plot ──────────────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(10, 8))
     im = ax.imshow(cosine_matrix, vmin=-1, vmax=1, cmap="RdBu_r")
@@ -144,7 +170,7 @@ def main():
     print(f"Saved: {out_fig}")
 
     # ── Identify window ───────────────────────────────────────────────────────
-    window = identify_persistence_window(cosine_matrix, threshold=COSINE_THRESHOLD)
+    window = identify_persistence_window(cosine_matrix, threshold=args.threshold)
 
     if len(window) >= 2:
         sub = cosine_matrix[np.ix_(window, window)]
@@ -174,7 +200,7 @@ def main():
         "window": window,
         "width": len(window),
         "mean_cosine": mean_cosine,
-        "threshold": COSINE_THRESHOLD,
+        "threshold": args.threshold,
         "verdict": verdict,
         "model": MODEL_ID,
         "n_train": n_train,
