@@ -44,10 +44,18 @@ ARTIFACTS_DIR.mkdir(exist_ok=True)
 MODEL_ID = "google/gemma-2-2b-it"
 COSINE_THRESHOLD = 0.8
 
+# Gemma-2 uses dual-norm (post_attention_layernorm + post_feedforward_layernorm applied
+# to sub-layer OUTPUTS before the residual add). This means:
+#   post_attention_layernorm input = raw attention output (NOT the residual stream) ← wrong
+#   pre_feedforward_layernorm input = residual after attention add = resid_mid       ← correct
+#   post_feedforward_layernorm input = raw MLP output (NOT the residual stream)     ← wrong
+# For resid_post, hook the layer output directly via the decoder layer module itself.
 EXTRACTION_MODULES = {
-    "post_attn": "post_attention_layernorm",   # residual stream mid-block (post-attention, pre-FFN)
-    "post_ffn":  "post_feedforward_layernorm", # full block output (post-FFN)
-    "input":     "input_layernorm",            # block input (pre-attention)
+    "resid_mid": "pre_feedforward_layernorm",  # residual stream after attention (Gemma-2 correct)
+    "resid_post": None,                         # handled separately: hook decoder layer output
+    "post_attn":  "post_attention_layernorm",  # attention output pre-residual (WRONG for resid_mid)
+    "post_ffn":   "post_feedforward_layernorm",# MLP output pre-residual (WRONG for resid_post)
+    "input":      "input_layernorm",           # block input = resid_pre
 }
 
 
@@ -93,10 +101,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Activation collection batch size (default: 16)")
     parser.add_argument("--extraction-point", choices=list(EXTRACTION_MODULES.keys()),
-                        default="post_attn",
-                        help="Which residual stream position to extract from "
-                             "(post_attn=post-attention, post_ffn=full block output, "
-                             "input=block input). Default: post_attn")
+                        default="resid_mid",
+                        help="Which residual stream position to extract from. "
+                             "resid_mid=pre_feedforward_layernorm input (correct for Gemma-2, default), "
+                             "resid_post=decoder layer output, "
+                             "input=input_layernorm input (block input). "
+                             "post_attn/post_ffn capture sub-layer outputs before residual add (not resid stream).")
     args = parser.parse_args()
 
     # --small sets defaults; explicit flags override
@@ -131,19 +141,30 @@ def main():
 
     module_name_suffix = EXTRACTION_MODULES[args.extraction_point]
     module_dict = dict(model.named_modules())
-    layer_modules = {
-        k: module_dict[f"model.layers.{k}.{module_name_suffix}"]
-        for k in range(n_layers)
-    }
+    if args.extraction_point == "resid_post":
+        # Hook the decoder layer output directly (no sub-module name)
+        layer_modules = {
+            k: module_dict[f"model.layers.{k}"]
+            for k in range(n_layers)
+        }
+    else:
+        layer_modules = {
+            k: module_dict[f"model.layers.{k}.{module_name_suffix}"]
+            for k in range(n_layers)
+        }
+
+    use_output_hook = (args.extraction_point == "resid_post")
 
     print("Collecting harmful activations...")
     harmful_acts = collect_activations(
-        model, tokenizer, harmful_train, layer_modules, batch_size=batch_size, device=device
+        model, tokenizer, harmful_train, layer_modules,
+        batch_size=batch_size, device=device, use_output_hook=use_output_hook,
     )
 
     print("Collecting harmless activations...")
     harmless_acts = collect_activations(
-        model, tokenizer, harmless_train, layer_modules, batch_size=batch_size, device=device
+        model, tokenizer, harmless_train, layer_modules,
+        batch_size=batch_size, device=device, use_output_hook=use_output_hook,
     )
 
     print("Computing DIM directions...")

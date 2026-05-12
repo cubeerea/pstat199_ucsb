@@ -40,12 +40,33 @@ def get_capture_pre_hook(
     positions: list[int] | None = None,
 ):
     """
-    Pre-hook that captures the INPUT of a layernorm module (= residual stream value)
-    at specified token positions. If positions is None, captures all positions.
-    Stored in cache[layer_idx] as a tensor.
+    Pre-hook that captures the INPUT of a module at specified token positions.
+    Use on layernorm sub-modules to capture the residual stream before normalization.
+    Stored in cache[layer_idx] as a tensor of shape (batch, len(positions), d_model).
     """
     def hook_fn(module, input):
         activation: Float[Tensor, "batch seq d_model"] = input[0]
+        if positions is not None:
+            cache[layer_idx] = activation[:, positions, :].detach().clone()
+        else:
+            cache[layer_idx] = activation.detach().clone()
+
+    return hook_fn
+
+
+def get_capture_output_hook(
+    layer_idx: int,
+    cache: dict,
+    positions: list[int] | None = None,
+):
+    """
+    Output hook that captures the OUTPUT of a module (e.g. a full decoder layer).
+    Handles tuple outputs — takes the first element (hidden_states).
+    Use for resid_post: hook the decoder layer itself to capture the full block output.
+    Stored in cache[layer_idx] as a tensor of shape (batch, len(positions), d_model).
+    """
+    def hook_fn(module, input, output):
+        activation = output[0] if isinstance(output, tuple) else output
         if positions is not None:
             cache[layer_idx] = activation[:, positions, :].detach().clone()
         else:

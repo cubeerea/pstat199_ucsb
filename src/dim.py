@@ -21,7 +21,7 @@ import torch
 from torch import Tensor
 from transformers import AutoTokenizer
 
-from src.hooks import add_hooks, get_capture_pre_hook
+from src.hooks import add_hooks, get_capture_pre_hook, get_capture_output_hook
 
 
 def get_chat_suffix_last_token_idx(tokenizer: AutoTokenizer, device: str = "cpu") -> int:
@@ -44,13 +44,15 @@ def collect_activations(
     layer_modules: dict,
     batch_size: int = 8,
     device: str | None = None,
+    use_output_hook: bool = False,
 ) -> dict[int, Tensor]:
     """
-    Run forward passes and collect residual stream activations at the last prompt token,
-    for each layer in layer_modules.
+    Run forward passes and collect residual stream activations at the last prompt token.
 
     Args:
-        layer_modules: dict mapping layer_idx -> layernorm module object to hook.
+        layer_modules: dict mapping layer_idx -> module to hook.
+        use_output_hook: if True, capture module OUTPUT (for resid_post via decoder layer).
+                         if False (default), capture module INPUT (for layernorm sub-modules).
         Returns: dict layer_idx -> tensor of shape (n_prompts, d_model)
     """
     if device is None:
@@ -60,30 +62,30 @@ def collect_activations(
 
     for i in range(0, len(instructions), batch_size):
         batch = instructions[i : i + batch_size]
-        chats = [
-            [{"role": "user", "content": instr}] for instr in batch
-        ]
+        chats = [[{"role": "user", "content": instr}] for instr in batch]
         inputs_str = tokenizer.apply_chat_template(
-            chats,
-            padding=True,
-            truncation=False,
-            add_generation_prompt=True,
-            tokenize=False,
+            chats, padding=True, truncation=False, add_generation_prompt=True, tokenize=False,
         )
         inputs = tokenizer(inputs_str, return_tensors="pt", padding=True, truncation=False)
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
         cache: dict[int, Tensor] = {}
-        pre_hooks = [
-            (module, get_capture_pre_hook(layer_idx=layer_idx, cache=cache, positions=[-1]))
-            for layer_idx, module in layer_modules.items()
-        ]
-
-        with add_hooks(module_forward_pre_hooks=pre_hooks, module_forward_hooks=[]):
-            model(**inputs)
+        if use_output_hook:
+            fwd_hooks = [
+                (module, get_capture_output_hook(layer_idx=layer_idx, cache=cache, positions=[-1]))
+                for layer_idx, module in layer_modules.items()
+            ]
+            with add_hooks(module_forward_pre_hooks=[], module_forward_hooks=fwd_hooks):
+                model(**inputs)
+        else:
+            pre_hooks = [
+                (module, get_capture_pre_hook(layer_idx=layer_idx, cache=cache, positions=[-1]))
+                for layer_idx, module in layer_modules.items()
+            ]
+            with add_hooks(module_forward_pre_hooks=pre_hooks, module_forward_hooks=[]):
+                model(**inputs)
 
         for k in layer_modules:
-            # cache[k]: (batch, 1, d_model) → squeeze seq dim
             all_acts[k].append(cache[k].squeeze(1).float().cpu())
 
     return {k: torch.cat(v, dim=0) for k, v in all_acts.items()}
