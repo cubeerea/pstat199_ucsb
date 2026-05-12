@@ -1,0 +1,12 @@
+artifacts/
+*.pt
+*.npy
+results/
+figures/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.DS_Store
+output/
+visualization/

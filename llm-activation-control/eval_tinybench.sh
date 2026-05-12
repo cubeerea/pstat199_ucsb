@@ -8,7 +8,8 @@ TASKS=(
     tinyWinogrande
 )
 
-export CUDA_VISIBLE_DEVICES=4
+# Set GPU index via env var: GPU=0 bash eval_tinybench.sh
+export CUDA_VISIBLE_DEVICES=${GPU:-0}
 METHOD_PREFIX=ITI
 # METHOD_PREFIX=DIM
 
