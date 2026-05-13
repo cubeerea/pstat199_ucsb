@@ -8,7 +8,6 @@ import functools
 from typing import Callable
 
 import torch
-from jaxtyping import Float
 from torch import Tensor
 
 
@@ -45,7 +44,7 @@ def get_capture_pre_hook(
     Stored in cache[layer_idx] as a tensor of shape (batch, len(positions), d_model).
     """
     def hook_fn(module, input):
-        activation: Float[Tensor, "batch seq d_model"] = input[0]
+        activation: Tensor = input[0]
         if positions is not None:
             cache[layer_idx] = activation[:, positions, :].detach().clone()
         else:
@@ -76,7 +75,7 @@ def get_capture_output_hook(
 
 
 def get_actadd_output_hook(
-    steering_vector: Float[Tensor, "d_model"],
+    steering_vector: Tensor,
     scale: float = 1.0,
 ):
     """
