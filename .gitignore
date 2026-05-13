@@ -165,11 +165,9 @@ __marimo__/
 .streamlit/secrets.toml
 
 # ── Project-specific ─────────────────────────────────────────────
-artifacts/
-*.pt
-*.npy
-results/
-figures/
-output/
-visualization/
+# artifacts/ and results/ are tracked — refusal vectors and ASR JSONs are
+# small derived tensors (<5 MB) that should persist across Colab sessions.
+figures/          # generated plots — reproducible, not worth versioning
+output/           # paper's original large steering configs — not ours
+visualization/    # paper's original visualization outputs
 .DS_Store
