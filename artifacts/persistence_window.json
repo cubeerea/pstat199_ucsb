@@ -1,0 +1,9 @@
+{
+  "window": [],
+  "width": 0,
+  "mean_cosine": 0.0,
+  "threshold": 0.8,
+  "verdict": "RED \u2014 window too weak. Escalate to Hank before proceeding.",
+  "model": "google/gemma-2-2b-it",
+  "n_train": 256
+}

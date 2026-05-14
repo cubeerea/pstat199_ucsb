@@ -63,6 +63,11 @@ class GlobalPIDController:
         self.prev_error: Tensor | None = None
         self._layer_order: list[int] = []
         self._steering_dirs: dict[int, Tensor] = {}
+        # Diagnostic norms (set by precompute_steering_dirs; no forward pass needed)
+        self.p_norms: dict[int, float] = {}
+        self.i_norms: dict[int, float] = {}
+        self.d_norms: dict[int, float] = {}
+        self.integral_norms: dict[int, float] = {}  # pre-scale ||integral||
 
     def precompute_steering_dirs(self) -> dict[int, Tensor]:
         """
@@ -76,6 +81,7 @@ class GlobalPIDController:
 
             p_term = self.kp * e
             self.integral = self.integral + e
+            self.integral_norms[k] = float(self.integral.norm())
             i_term = self.ki * self.integral
 
             if self.prev_error is None:
@@ -83,6 +89,10 @@ class GlobalPIDController:
             else:
                 d_term = self.kd * (e - self.prev_error)
             self.prev_error = e.clone()
+
+            self.p_norms[k] = float(p_term.norm())
+            self.i_norms[k] = float(i_term.norm())
+            self.d_norms[k] = float(d_term.norm())
 
             u = p_term + i_term + d_term
             self._steering_dirs[k] = u.clone()
@@ -108,6 +118,7 @@ class GlobalPIDControllerAntiWindup(GlobalPIDController):
             e = self.r_bar
             p_term = self.kp * e
             self.integral = self.integral + e
+            self.integral_norms[k] = float(self.integral.norm())  # pre-clamp
             i_clamped = torch.clamp(self.integral, min=-clamp_limit, max=clamp_limit)
             i_term = self.ki * i_clamped
 
@@ -116,6 +127,10 @@ class GlobalPIDControllerAntiWindup(GlobalPIDController):
             else:
                 d_term = self.kd * (e - self.prev_error)
             self.prev_error = e.clone()
+
+            self.p_norms[k] = float(p_term.norm())
+            self.i_norms[k] = float(i_term.norm())
+            self.d_norms[k] = float(d_term.norm())
 
             u = p_term + i_term + d_term
             self._steering_dirs[k] = u.clone()
