@@ -13,10 +13,10 @@ Outputs:
   figures/asr_and_ppl_vs_ki_NNN.png     — 2-panel: ASR (top) + PPL (bottom)
 
 Usage:
-  python experiments/sweep_ki.py --small
-  python experiments/sweep_ki.py                        # Kp=1.0 only
-  python experiments/sweep_ki.py --kp 1.0 1.5          # both Kp values
-  python experiments/sweep_ki.py --ki 0.0 0.05 0.10    # custom Ki grid
+  python experiments/06_sweep_ki.py --small
+  python experiments/06_sweep_ki.py                        # Kp=1.0 only
+  python experiments/06_sweep_ki.py --kp 1.0 1.5          # both Kp values
+  python experiments/06_sweep_ki.py --ki 0.0 0.05 0.10    # custom Ki grid
 """
 import argparse
 import json
