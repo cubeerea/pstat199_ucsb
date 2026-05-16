@@ -118,9 +118,11 @@ class GlobalPIDControllerAntiWindup(GlobalPIDController):
             e = self.r_bar
             p_term = self.kp * e
             self.integral = self.integral + e
-            self.integral_norms[k] = float(self.integral.norm())  # pre-clamp
-            i_clamped = torch.clamp(self.integral, min=-clamp_limit, max=clamp_limit)
-            i_term = self.ki * i_clamped
+            self.integral_norms[k] = float(self.integral.norm())  # pre-clamp L2 norm
+            integral_norm = self.integral.norm()
+            if integral_norm > clamp_limit:
+                self.integral = self.integral * (clamp_limit / integral_norm)
+            i_term = self.ki * self.integral
 
             if self.prev_error is None:
                 d_term = torch.zeros_like(e)
