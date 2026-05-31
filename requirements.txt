@@ -1,21 +1,20 @@
-# Core ML
+# Requirements for pstat199_v2 experiments (01–07)
+# Install into a fresh venv:
+#   python3 -m venv ~/pstat199_env
+#   source ~/pstat199_env/bin/activate
+#   pip install -r requirements.txt
+
+# Deep learning
 torch>=2.2.0
 transformers>=4.40.0
-accelerate>=0.30.0
+accelerate>=0.29.0          # needed by transformers for device_map / large model loading
 
 # Data
 datasets>=2.19.0
-scikit-learn>=1.4.0
 pandas>=2.0.0
-numpy>=1.26.0
-
-# Visualization
-matplotlib>=3.8.0
-seaborn>=0.13.0
-
-# Utilities
-tqdm>=4.66.0
 requests>=2.31.0
+scikit-learn>=1.4.0         # src/data.py: train_test_split
 
-# GCG suffix generation (optional — only needed for 04_gcg_attack.py full run)
-# nanogcg>=0.1.0
+# Numerics & plotting
+numpy>=1.26.0
+matplotlib>=3.8.0
