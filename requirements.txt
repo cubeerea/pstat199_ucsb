@@ -1,0 +1,21 @@
+# Core ML
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.30.0
+
+# Data
+datasets>=2.19.0
+scikit-learn>=1.4.0
+pandas>=2.0.0
+numpy>=1.26.0
+
+# Visualization
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Utilities
+tqdm>=4.66.0
+requests>=2.31.0
+
+# GCG suffix generation (optional — only needed for 04_gcg_attack.py full run)
+# nanogcg>=0.1.0
