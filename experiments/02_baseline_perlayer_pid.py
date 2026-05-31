@@ -6,11 +6,15 @@ Prerequisites:
 
 Outputs:
   results/baseline_perlayer_pid_asr.json
+  artifacts/completions/<tag>.jsonl   (if --save-completions is set)
 
 Usage:
   python experiments/02_baseline_perlayer_pid.py --small
   python experiments/02_baseline_perlayer_pid.py
   python experiments/02_baseline_perlayer_pid.py --kp 1.0 --ki 0.05 --kd 0.0 --scale 1.5
+  python experiments/02_baseline_perlayer_pid.py --n-test 20 --save-completions diag_nosteer
+  python experiments/02_baseline_perlayer_pid.py --attack gcg
+  python experiments/02_baseline_perlayer_pid.py --attack affirmative
 """
 import argparse
 import json
@@ -22,16 +26,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
+from src.attacks import ATTACK_NAMES, apply_attack
 from src.controllers import PerLayerPIDController
 from src.data import load_data
-from src.eval import compute_asr
+from src.eval import compute_asr, is_jailbreak
 from src.hooks import add_hooks, get_actadd_output_hook
 
 RESULTS_DIR = Path("results")
 ARTIFACTS_DIR = Path("artifacts")
+COMPLETIONS_DIR = ARTIFACTS_DIR / "completions"
 RESULTS_DIR.mkdir(exist_ok=True)
+COMPLETIONS_DIR.mkdir(exist_ok=True)
 
 MODEL_ID = "google/gemma-2-2b-it"
+
+
+def save_completions(path: Path, prompts: list[str], completions: list[str]) -> None:
+    with open(path, "w") as f:
+        for prompt, completion in zip(prompts, completions):
+            row = {
+                "prompt": prompt,
+                "completion": completion,
+                "is_jailbreak": is_jailbreak(completion),
+            }
+            f.write(json.dumps(row) + "\n")
+    print(f"  Saved {len(completions)} completions → {path}")
 
 
 def generate_completions(model, tokenizer, instructions, fwd_hooks, batch_size, max_new_tokens, device):
@@ -80,6 +99,11 @@ def main():
                         help="Derivative gain (default: 0.01)")
     parser.add_argument("--scale", type=float, default=1.0,
                         help="Steering vector scale / alpha (default: 1.0)")
+    parser.add_argument("--attack", choices=ATTACK_NAMES, default="none",
+                        help="Attack to apply to prompts (default: none)")
+    parser.add_argument("--save-completions", metavar="TAG", default=None,
+                        help="If set, save (prompt, completion, is_jailbreak) JSONL to "
+                             "artifacts/completions/<TAG>_<condition>.jsonl")
     args = parser.parse_args()
 
     n_test = args.n_test if args.n_test is not None else (10 if args.small else None)
@@ -96,7 +120,8 @@ def main():
         device = "cpu"
 
     print(f"Device: {device} | n_test: {n_test or 'all'} | "
-          f"Kp={args.kp} Ki={args.ki} Kd={args.kd} scale={args.scale} | model: {MODEL_ID}")
+          f"Kp={args.kp} Ki={args.ki} Kd={args.kd} scale={args.scale} | "
+          f"attack={args.attack} | model: {MODEL_ID}")
 
     per_layer_path = ARTIFACTS_DIR / "refusal_vectors_per_layer.pt"
     if not per_layer_path.exists():
@@ -106,8 +131,11 @@ def main():
     ref_dirs = {k: v.to(device) for k, v in torch.load(per_layer_path).items()}
     print(f"Loaded per-layer refusal directions for {len(ref_dirs)} layers.")
 
-    _, harmful_test, _, _ = load_data(n_test=n_test)
-    print(f"Test set: {len(harmful_test)} harmful prompts")
+    _, harmful_raw, _, _ = load_data(n_test=n_test)
+    harmful_test = apply_attack(harmful_raw, args.attack)
+    print(f"Test set: {len(harmful_test)} harmful prompts (attack={args.attack})")
+    if args.attack != "none":
+        print(f"  Example: {harmful_test[0][:120]}...")
 
     print("Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="left")
@@ -128,8 +156,13 @@ def main():
         max_new_tokens=max_new_tokens, device=device
     )
     asr_base = compute_asr(completions_base)
-    results["no_steering"] = asr_base
+    results["no_steering"] = {**asr_base, "attack": args.attack}
     print(f"  No-steering ASR: {asr_base['asr']:.3f} ({asr_base['n_success']}/{asr_base['n_total']})")
+    if args.save_completions:
+        save_completions(
+            COMPLETIONS_DIR / f"{args.save_completions}_no_steering.jsonl",
+            harmful_raw, completions_base,
+        )
 
     # ── Condition 2: Per-layer PID steering ───────────────────────────────────
     print("\n[2/2] Per-layer PID steering")
@@ -149,15 +182,24 @@ def main():
         max_new_tokens=max_new_tokens, device=device
     )
     asr_pid = compute_asr(completions_pid)
-    results["perlayer_pid"] = {**asr_pid, "kp": args.kp, "ki": args.ki, "kd": args.kd, "scale": args.scale}
+    results["perlayer_pid"] = {
+        **asr_pid, "attack": args.attack,
+        "kp": args.kp, "ki": args.ki, "kd": args.kd, "scale": args.scale,
+    }
     print(f"  Per-layer PID ASR: {asr_pid['asr']:.3f} ({asr_pid['n_success']}/{asr_pid['n_total']})")
+    if args.save_completions:
+        save_completions(
+            COMPLETIONS_DIR / f"{args.save_completions}_perlayer_pid.jsonl",
+            harmful_raw, completions_pid,
+        )
 
-    print(f"\nDirect-attack ASR summary:")
+    print(f"\nASR summary (attack={args.attack}):")
     print(f"  No steering:   {results['no_steering']['asr']:.3f}")
     print(f"  Per-layer PID: {results['perlayer_pid']['asr']:.3f}  "
           f"(Kp={args.kp}, Ki={args.ki}, Kd={args.kd}, scale={args.scale})")
 
-    out_path = RESULTS_DIR / "baseline_perlayer_pid_asr.json"
+    attack_tag = f"_{args.attack}" if args.attack != "none" else ""
+    out_path = RESULTS_DIR / f"baseline_perlayer_pid_asr{attack_tag}.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved: {out_path}")

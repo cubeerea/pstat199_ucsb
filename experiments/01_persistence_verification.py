@@ -19,6 +19,8 @@ Usage:
   python experiments/01_persistence_verification.py
   python experiments/01_persistence_verification.py --extraction-point post_ffn --threshold 0.5
   python experiments/01_persistence_verification.py --n-train 512 --batch-size 32
+  python experiments/01_persistence_verification.py --threshold 0.5 --commit
+    (--commit writes results as the canonical artifacts/persistence_window.json)
 """
 import argparse
 import json
@@ -107,6 +109,11 @@ def main():
                              "resid_post=decoder layer output, "
                              "input=input_layernorm input (block input). "
                              "post_attn/post_ffn capture sub-layer outputs before residual add (not resid stream).")
+    parser.add_argument("--commit", action="store_true",
+                        help="If set, write this run's artifacts as the canonical "
+                             "artifacts/persistence_window.json and artifacts/refusal_vector_global.pt "
+                             "used by downstream experiments. Without --commit, artifacts are saved "
+                             "only to versioned paths (persistence_window_<thresh>_<extract>.json).")
     args = parser.parse_args()
 
     # --small sets defaults; explicit flags override
@@ -258,30 +265,53 @@ def main():
     else:
         print(f"Decision: {verdict}")
 
-    # ── Save canonical artifacts (used by 02/03) ──────────────────────────────
+    # ── Save versioned artifacts (never overwritten) ──────────────────────────
+    thresh_tag = f"{args.threshold:.2f}".replace(".", "")
+    ext_tag = args.extraction_point
+    versioned_window_path = ARTIFACTS_DIR / f"persistence_window_{thresh_tag}_{ext_tag}.json"
+
     window_data = {
         "window": window, "width": len(window), "mean_cosine": mean_cosine,
         "threshold": args.threshold, "verdict": verdict, "model": MODEL_ID,
         "n_train": n_train, "extraction_point": args.extraction_point, "run_id": run_id,
     }
-    window_path = ARTIFACTS_DIR / "persistence_window.json"
-    with open(window_path, "w") as f:
+    with open(versioned_window_path, "w") as f:
         json.dump(window_data, f, indent=2)
-    print(f"Saved: {window_path}")
+    print(f"Saved (versioned): {versioned_window_path}")
 
-    per_layer_path = ARTIFACTS_DIR / "refusal_vectors_per_layer.pt"
-    torch.save({k: ref_dirs[k].cpu() for k in layers}, per_layer_path)
-    print(f"Saved: {per_layer_path}")
+    versioned_per_layer_path = ARTIFACTS_DIR / f"refusal_vectors_per_layer_{thresh_tag}_{ext_tag}.pt"
+    torch.save({k: ref_dirs[k].cpu() for k in layers}, versioned_per_layer_path)
+    print(f"Saved (versioned): {versioned_per_layer_path}")
 
     if window:
         r_bar = global_vector_from_window(ref_dirs, window)
-        global_path = ARTIFACTS_DIR / "refusal_vector_global.pt"
-        torch.save(r_bar.cpu(), global_path)
-        print(f"Saved: {global_path}  (norm: {r_bar.norm():.4f})")
+        versioned_global_path = ARTIFACTS_DIR / f"refusal_vector_global_{thresh_tag}_{ext_tag}.pt"
+        torch.save(r_bar.cpu(), versioned_global_path)
+        print(f"Saved (versioned): {versioned_global_path}  (norm: {r_bar.norm():.4f})")
     else:
         print("WARNING: No persistence window identified. r_bar not saved.")
+        r_bar = None
 
-    print(f"\nDone. Figure: {out_fig}  |  Window: {window_path}")
+    # ── Optionally commit as canonical (used by 02/03/04/05/06) ──────────────
+    if args.commit:
+        canonical_window = ARTIFACTS_DIR / "persistence_window.json"
+        canonical_per_layer = ARTIFACTS_DIR / "refusal_vectors_per_layer.pt"
+        with open(canonical_window, "w") as f:
+            json.dump(window_data, f, indent=2)
+        torch.save({k: ref_dirs[k].cpu() for k in layers}, canonical_per_layer)
+        print(f"\n--commit: wrote canonical artifacts:")
+        print(f"  {canonical_window}")
+        print(f"  {canonical_per_layer}")
+        if r_bar is not None:
+            canonical_global = ARTIFACTS_DIR / "refusal_vector_global.pt"
+            torch.save(r_bar.cpu(), canonical_global)
+            print(f"  {canonical_global}")
+        else:
+            print("  WARNING: r_bar not saved (empty window).")
+    else:
+        print("\nNot committed as canonical (pass --commit to update artifacts/persistence_window.json).")
+
+    print(f"\nDone. Figure: {out_fig}  |  Window: {versioned_window_path}")
 
 
 if __name__ == "__main__":

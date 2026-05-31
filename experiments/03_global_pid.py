@@ -14,8 +14,10 @@ Outputs:
 Usage:
   python experiments/03_global_pid.py --small
   python experiments/03_global_pid.py
-  python experiments/03_global_pid.py --kp 1.0 --ki 0.05 --kd 0.0 --scale 0.5
+  python experiments/03_global_pid.py --kp 1.0 --ki 0.05 --kd 0.0 --scale 20.0
   python experiments/03_global_pid.py --ki 0.1 --tag ki010   # windup-regime probe
+  python experiments/03_global_pid.py --scale 20.0 --attack gcg --save-completions main_gcg
+  python experiments/03_global_pid.py --scale 20.0 --sign -1  # reverse-sign sanity check
 """
 import argparse
 import json
@@ -29,19 +31,33 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
+from src.attacks import ATTACK_NAMES, apply_attack
 from src.controllers import GlobalPIDController, GlobalPIDControllerAntiWindup
 from src.data import load_data
-from src.eval import compute_asr
+from src.eval import compute_asr, is_jailbreak
 from src.hooks import add_hooks, get_actadd_output_hook, get_capture_output_hook
 
 RESULTS_DIR = Path("results")
 ARTIFACTS_DIR = Path("artifacts")
 FIGURES_DIR = Path("figures")
+COMPLETIONS_DIR = ARTIFACTS_DIR / "completions"
 RESULTS_DIR.mkdir(exist_ok=True)
 FIGURES_DIR.mkdir(exist_ok=True)
+COMPLETIONS_DIR.mkdir(exist_ok=True)
 
 MODEL_ID = "google/gemma-2-2b-it"
 CAPTURE_N = 32  # prompts for diagnostic capture pass (not generation)
+
+
+def save_completions(path: Path, prompts: list[str], completions: list[str]) -> None:
+    with open(path, "w") as f:
+        for prompt, completion in zip(prompts, completions):
+            f.write(json.dumps({
+                "prompt": prompt,
+                "completion": completion,
+                "is_jailbreak": is_jailbreak(completion),
+            }) + "\n")
+    print(f"  Saved {len(completions)} completions → {path}")
 
 
 # ── Figure helpers (mirror 01_persistence_verification.py convention) ────────
@@ -154,6 +170,13 @@ def main():
                         help="Steering vector scale / alpha (default: 1.0)")
     parser.add_argument("--tag", type=str, default="",
                         help="Optional suffix for output filenames, e.g. ki010 → global_pid_asr_ki010.json")
+    parser.add_argument("--attack", choices=ATTACK_NAMES, default="none",
+                        help="Attack to apply to test prompts (default: none)")
+    parser.add_argument("--sign", type=int, choices=[1, -1], default=1,
+                        help="Steering direction: 1=toward refusal (default), -1=away (sanity check)")
+    parser.add_argument("--save-completions", metavar="TAG", default=None,
+                        help="Save (prompt, completion, is_jailbreak) JSONL to "
+                             "artifacts/completions/<TAG>_<condition>.jsonl")
     args = parser.parse_args()
 
     n_test = args.n_test if args.n_test is not None else (10 if args.small else None)
@@ -169,8 +192,10 @@ def main():
     else:
         device = "cpu"
 
+    sign_label = "REVERSE (sanity check)" if args.sign == -1 else "forward"
     print(f"Device: {device} | n_test: {n_test or 'all'} | "
-          f"Kp={args.kp} Ki={args.ki} Kd={args.kd} scale={args.scale} | model: {MODEL_ID}")
+          f"Kp={args.kp} Ki={args.ki} Kd={args.kd} scale={args.scale} | "
+          f"attack={args.attack} sign={sign_label} | model: {MODEL_ID}")
 
     global_path = ARTIFACTS_DIR / "refusal_vector_global.pt"
     window_path = ARTIFACTS_DIR / "persistence_window.json"
@@ -192,8 +217,11 @@ def main():
     print(f"Window W = layers {window[0]}-{window[-1]} ({len(window)} layers), "
           f"mean cosine: {window_data['mean_cosine']:.3f} [{window_data['verdict']}]")
 
-    _, harmful_test, _, _ = load_data(n_test=n_test)
-    print(f"Test set: {len(harmful_test)} harmful prompts")
+    _, harmful_raw, _, _ = load_data(n_test=n_test)
+    harmful_test = apply_attack(harmful_raw, args.attack)
+    print(f"Test set: {len(harmful_test)} harmful prompts (attack={args.attack})")
+    if args.attack != "none":
+        print(f"  Example: {harmful_test[0][:120]}...")
 
     # Subsample for diagnostic capture (cheap single forward pass)
     capture_prompts = harmful_test[:min(CAPTURE_N, len(harmful_test))]
@@ -220,8 +248,9 @@ def main():
         results["perlayer_pid"] = baseline.get("perlayer_pid")
 
     # ── Global PID ────────────────────────────────────────────────────────────
-    print("\n[1/2] Global PID")
-    ctrl = GlobalPIDController(r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window)
+    cond_label = f"global_pid{'_reverse' if args.sign == -1 else ''}"
+    print(f"\n[1/2] {cond_label}")
+    ctrl = GlobalPIDController(r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window, sign=args.sign)
     steering_dirs = ctrl.precompute_steering_dirs()
 
     # Log term magnitudes (deterministic from recurrence — no forward pass needed)
@@ -250,17 +279,24 @@ def main():
         model, tokenizer, harmful_test, fwd_hooks, batch_size, max_new_tokens, device
     )
     asr = compute_asr(completions)
-    results["global_pid"] = {**asr, "kp": args.kp, "ki": args.ki, "kd": args.kd,
-                              "scale": args.scale, "window": window,
-                              "p_norms": ctrl.p_norms, "i_norms": ctrl.i_norms,
-                              "d_norms": ctrl.d_norms, "integral_norms": ctrl.integral_norms,
-                              "act_norms_by_layer": act_norms_global}
-    print(f"  Global PID ASR: {asr['asr']:.3f} ({asr['n_success']}/{asr['n_total']})")
+    results[cond_label] = {**asr, "kp": args.kp, "ki": args.ki, "kd": args.kd,
+                           "scale": args.scale, "sign": args.sign, "attack": args.attack,
+                           "window": window,
+                           "p_norms": ctrl.p_norms, "i_norms": ctrl.i_norms,
+                           "d_norms": ctrl.d_norms, "integral_norms": ctrl.integral_norms,
+                           "act_norms_by_layer": act_norms_global}
+    print(f"  {cond_label} ASR: {asr['asr']:.3f} ({asr['n_success']}/{asr['n_total']})")
+    if args.save_completions:
+        save_completions(
+            COMPLETIONS_DIR / f"{args.save_completions}_{cond_label}.jsonl",
+            harmful_raw, completions,
+        )
 
     # ── Global PID + Anti-windup ──────────────────────────────────────────────
-    print("\n[2/2] Global PID + Anti-windup")
+    aw_label = f"global_pid_antiwindup{'_reverse' if args.sign == -1 else ''}"
+    print(f"\n[2/2] {aw_label}")
     ctrl_aw = GlobalPIDControllerAntiWindup(
-        r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window
+        r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window, sign=args.sign
     )
     steering_dirs_aw = ctrl_aw.precompute_steering_dirs()
 
@@ -282,13 +318,19 @@ def main():
         model, tokenizer, harmful_test, fwd_hooks_aw, batch_size, max_new_tokens, device
     )
     asr_aw = compute_asr(completions_aw)
-    results["global_pid_antiwindup"] = {**asr_aw, "kp": args.kp, "ki": args.ki, "kd": args.kd,
-                                         "scale": args.scale, "window": window,
-                                         "p_norms": ctrl_aw.p_norms, "i_norms": ctrl_aw.i_norms,
-                                         "d_norms": ctrl_aw.d_norms,
-                                         "integral_norms": ctrl_aw.integral_norms,
-                                         "act_norms_by_layer": act_norms_aw}
-    print(f"  Global PID + AW ASR: {asr_aw['asr']:.3f} ({asr_aw['n_success']}/{asr_aw['n_total']})")
+    results[aw_label] = {**asr_aw, "kp": args.kp, "ki": args.ki, "kd": args.kd,
+                         "scale": args.scale, "sign": args.sign, "attack": args.attack,
+                         "window": window,
+                         "p_norms": ctrl_aw.p_norms, "i_norms": ctrl_aw.i_norms,
+                         "d_norms": ctrl_aw.d_norms,
+                         "integral_norms": ctrl_aw.integral_norms,
+                         "act_norms_by_layer": act_norms_aw}
+    print(f"  {aw_label} ASR: {asr_aw['asr']:.3f} ({asr_aw['n_success']}/{asr_aw['n_total']})")
+    if args.save_completions:
+        save_completions(
+            COMPLETIONS_DIR / f"{args.save_completions}_{aw_label}.jsonl",
+            harmful_raw, completions_aw,
+        )
 
     # ── Unsteered capture (no baseline JSON) ─────────────────────────────────
     if "no_steering" not in results or results["no_steering"] is None:
@@ -305,8 +347,10 @@ def main():
         if res and isinstance(res, dict) and "asr" in res:
             print(f"  {cond:<30} ASR={res['asr']:.3f}")
 
+    attack_tag = f"_{args.attack}" if args.attack != "none" else ""
+    sign_tag = "_reverse" if args.sign == -1 else ""
     tag_suffix = f"_{args.tag}" if args.tag else ""
-    out_path = RESULTS_DIR / f"global_pid_asr{tag_suffix}.json"
+    out_path = RESULTS_DIR / f"global_pid_asr{attack_tag}{sign_tag}{tag_suffix}.json"
     # Convert int keys to str for JSON
     def jsonify(obj):
         if isinstance(obj, dict):

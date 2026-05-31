@@ -41,6 +41,8 @@ class GlobalPIDController:
 
     Error signal: constant e(k) = r_bar (Q1 default).
     The I-term accumulates linearly with layer index → integral windup test.
+
+    sign: 1 (default, steer toward refusal) or -1 (sanity check: steer away).
     """
 
     def __init__(
@@ -50,12 +52,14 @@ class GlobalPIDController:
         ki: float = 0.01,
         kd: float = 0.01,
         window: list[int] | None = None,
+        sign: int = 1,
     ):
-        self.r_bar = r_bar
+        self.r_bar = r_bar * sign
         self.kp = kp
         self.ki = ki
         self.kd = kd
         self.window = window or []
+        self.sign = sign
         self.reset()
 
     def reset(self):
@@ -109,6 +113,7 @@ class GlobalPIDControllerAntiWindup(GlobalPIDController):
     """
     Global PID with I-term clamped to 2 * ||r_bar||.
     Ablation condition per CLAUDE.md §4.4.
+    sign is inherited from GlobalPIDController.
     """
 
     def precompute_steering_dirs(self) -> dict[int, Tensor]:
