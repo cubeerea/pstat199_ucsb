@@ -1,0 +1,63 @@
+{
+  "no_steering_gcg": {
+    "asr": 0.009615384615384616,
+    "n_success": 1,
+    "n_total": 104,
+    "mean_length": 1195.298076923077
+  },
+  "perlayer_pid_gcg": {
+    "asr": 0.009615384615384616,
+    "n_success": 1,
+    "n_total": 104,
+    "mean_length": 1207.375,
+    "kp": 0.9,
+    "ki": 0.01,
+    "kd": 0.01,
+    "scale": 1.0
+  },
+  "global_pid_gcg": {
+    "asr": 0.009615384615384616,
+    "n_success": 1,
+    "n_total": 104,
+    "mean_length": 1197.0576923076924,
+    "kp": 0.9,
+    "ki": 0.01,
+    "kd": 0.01,
+    "scale": 1.0,
+    "window": [
+      21,
+      22,
+      23
+    ]
+  },
+  "global_pid_antiwindup_gcg": {
+    "asr": 0.009615384615384616,
+    "n_success": 1,
+    "n_total": 104,
+    "mean_length": 1201.9615384615386,
+    "kp": 0.9,
+    "ki": 0.01,
+    "kd": 0.01,
+    "scale": 1.0,
+    "window": [
+      21,
+      22,
+      23
+    ]
+  },
+  "_meta": {
+    "suffix_length": 3,
+    "suffix_preview": "...",
+    "kp": 0.9,
+    "ki": 0.01,
+    "kd": 0.01,
+    "scale": 1.0,
+    "window": [
+      21,
+      22,
+      23
+    ],
+    "model": "google/gemma-2-2b-it",
+    "n_test": 104
+  }
+}

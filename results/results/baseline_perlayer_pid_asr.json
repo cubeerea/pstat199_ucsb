@@ -1,0 +1,18 @@
+{
+  "no_steering": {
+    "asr": 0.009615384615384616,
+    "n_success": 1,
+    "n_total": 104,
+    "mean_length": 1202.326923076923
+  },
+  "perlayer_pid": {
+    "asr": 0.009615384615384616,
+    "n_success": 1,
+    "n_total": 104,
+    "mean_length": 1204.3557692307693,
+    "kp": 0.9,
+    "ki": 0.01,
+    "kd": 0.01,
+    "scale": 1.0
+  }
+}

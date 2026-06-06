@@ -73,9 +73,10 @@ run_experiment "04" "experiments/04_gcg_attack.py" \
     --scale 20.0
 
 run_experiment "05" "experiments/05_capability_eval.py" \
-    --scale 20.0
+    --scale 20.0 --kp 0.9 --ki 0.01 --kd 0.01 
 
-run_experiment "06" "experiments/06_sweep_ki.py"
+run_experiment "06" "experiments/06_sweep_ki.py" \
+    --scale 50.0 --kp 0.9 
 
 run_experiment "07" "experiments/07_scale_calibration.py"
 
