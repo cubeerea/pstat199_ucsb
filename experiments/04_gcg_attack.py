@@ -114,9 +114,13 @@ def main():
     parser.add_argument("--scale", type=float, default=1.0)
     parser.add_argument("--attack", choices=ATTACK_NAMES, default="gcg",
                         help="Attack to apply (default: gcg)")
+    parser.add_argument("--sign", type=int, choices=[1, -1], default=1,
+                        help="Steering direction: 1=toward refusal, -1=away (sanity check)")
     parser.add_argument("--save-completions", metavar="TAG", default=None,
                         help="Save (prompt, completion, is_jailbreak) JSONL to "
                              "artifacts/completions/<TAG>_<condition>.jsonl")
+    parser.add_argument("--tag", type=str, default="",
+                        help="Optional suffix for output filenames")
     args = parser.parse_args()
 
     n_test = args.n_test if args.n_test is not None else (10 if args.small else None)
@@ -153,9 +157,10 @@ def main():
             "python experiments/01_persistence_verification.py --threshold 0.5 --commit"
         )
 
+    sign_label = "REVERSE (sanity check)" if args.sign == -1 else "forward"
     print(f"Window W = layers {window[0]}-{window[-1]} ({len(window)} layers) | "
           f"Kp={args.kp} Ki={args.ki} Kd={args.kd} scale={args.scale} | "
-          f"attack={args.attack} | model: {MODEL_ID}")
+          f"attack={args.attack} sign={sign_label} | model: {MODEL_ID}")
 
     _, harmful_raw, _, _ = load_data(n_test=n_test)
     attacked_prompts = apply_attack(harmful_raw, args.attack)
@@ -190,7 +195,7 @@ def main():
 
     # ── Condition 2: Per-layer PID + attack ──────────────────────────────────
     print(f"\n[2/4] Per-layer PID + {args.attack}")
-    ctrl_pl = PerLayerPIDController(ref_dirs, kp=args.kp, ki=args.ki, kd=args.kd)
+    ctrl_pl = PerLayerPIDController(ref_dirs, kp=args.kp, ki=args.ki, kd=args.kd, sign=args.sign)
     hooks_pl = [
         (
             module_dict[f"model.layers.{k}.post_attention_layernorm"],
@@ -210,7 +215,7 @@ def main():
 
     # ── Condition 3: Global PID + attack ─────────────────────────────────────
     print(f"\n[3/4] Global PID + {args.attack}")
-    ctrl_g = GlobalPIDController(r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window)
+    ctrl_g = GlobalPIDController(r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window, sign=args.sign)
     sdirs_g = ctrl_g.precompute_steering_dirs()
     hooks_g = [
         (
@@ -231,7 +236,7 @@ def main():
 
     # ── Condition 4: Global PID + Anti-windup + attack ────────────────────────
     print(f"\n[4/4] Global PID + Anti-windup + {args.attack}")
-    ctrl_aw = GlobalPIDControllerAntiWindup(r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window)
+    ctrl_aw = GlobalPIDControllerAntiWindup(r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window, sign=args.sign)
     sdirs_aw = ctrl_aw.precompute_steering_dirs()
     hooks_aw = [
         (
@@ -256,7 +261,7 @@ def main():
         print(f"  {cond:<35} ASR={res['asr']:.3f}  ({res['n_success']}/{res['n_total']})")
 
     results["_meta"] = {
-        "attack": args.attack,
+        "attack": args.attack, "sign": args.sign,
         "kp": args.kp, "ki": args.ki, "kd": args.kd, "scale": args.scale,
         "window": window,
         "model": MODEL_ID,
@@ -264,7 +269,9 @@ def main():
     }
 
     attack_tag = f"_{args.attack}" if args.attack != "none" else ""
-    out_path = RESULTS_DIR / f"attack_asr{attack_tag}.json"
+    sign_tag = "_reverse" if args.sign == -1 else ""
+    user_tag = f"_{args.tag}" if args.tag else ""
+    out_path = RESULTS_DIR / f"attack_asr{attack_tag}{sign_tag}{user_tag}.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved: {out_path}")

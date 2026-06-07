@@ -29,22 +29,35 @@ import matplotlib.pyplot as plt
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
+from src.attacks import ATTACK_NAMES, apply_attack
 from src.controllers import GlobalPIDController, GlobalPIDControllerAntiWindup
 from src.data import load_data
-from src.eval import compute_asr
+from src.eval import compute_asr, is_jailbreak
 from src.hooks import add_hooks, get_actadd_output_hook
 from src.perplexity import compute_perplexity, load_reference_model
 
 RESULTS_DIR = Path("results")
 FIGURES_DIR = Path("figures")
 ARTIFACTS_DIR = Path("artifacts")
+COMPLETIONS_DIR = ARTIFACTS_DIR / "completions"
 RESULTS_DIR.mkdir(exist_ok=True)
 FIGURES_DIR.mkdir(exist_ok=True)
+COMPLETIONS_DIR.mkdir(exist_ok=True)
 
 MODEL_ID = "google/gemma-2-2b-it"
 KI_GRID_DEFAULT = [0.0, 0.03, 0.05, 0.10, 0.13, 0.15]
 KP_DEFAULT = [1.0]
-KD_FIXED = 0.0
+
+
+def save_completions(path: Path, prompts: list[str], completions: list[str]) -> None:
+    with open(path, "w") as f:
+        for prompt, completion in zip(prompts, completions):
+            f.write(json.dumps({
+                "prompt": prompt,
+                "completion": completion,
+                "is_jailbreak": is_jailbreak(completion),
+            }) + "\n")
+    print(f"  Saved {len(completions)} completions → {path}")
 
 
 def next_run_id(directory: Path, prefix: str) -> int:
@@ -82,16 +95,16 @@ def generate_completions(model, tokenizer, instructions, fwd_hooks, batch_size, 
     return completions
 
 
-def run_condition(label, ctrl_cls, r_bar, kp, ki, kd, window, module_dict,
-                  model, tokenizer, harmful_test, batch_size, max_new_tokens, device,
-                  ref_model, ref_tokenizer):
-    ctrl = ctrl_cls(r_bar=r_bar, kp=kp, ki=ki, kd=kd, window=window)
+def run_condition(label, ctrl_cls, r_bar, kp, ki, kd, scale, sign, window, module_dict,
+                  model, tokenizer, harmful_test, harmful_raw, batch_size, max_new_tokens,
+                  device, ref_model, ref_tokenizer, save_tag=None, attack="none"):
+    ctrl = ctrl_cls(r_bar=r_bar, kp=kp, ki=ki, kd=kd, window=window, sign=sign)
     steering_dirs = ctrl.precompute_steering_dirs()
 
     fwd_hooks = [
         (
             module_dict[f"model.layers.{k}.post_attention_layernorm"],
-            get_actadd_output_hook(steering_dirs[k].to(device), scale=1.0),
+            get_actadd_output_hook(steering_dirs[k].to(device), scale=scale),
         )
         for k in window
         if f"model.layers.{k}.post_attention_layernorm" in module_dict
@@ -102,10 +115,15 @@ def run_condition(label, ctrl_cls, r_bar, kp, ki, kd, window, module_dict,
     )
     asr = compute_asr(completions)
     ppl = compute_perplexity(completions, ref_model, ref_tokenizer, device)
+
+    if save_tag:
+        save_completions(COMPLETIONS_DIR / f"{save_tag}_{label}.jsonl", harmful_raw, completions)
+
     return {
         **asr,
         "perplexity": ppl,
-        "kp": kp, "ki": ki, "kd": kd, "window": window,
+        "kp": kp, "ki": ki, "kd": kd, "scale": scale, "sign": sign,
+        "attack": attack, "window": window,
         "p_norms": {str(k): ctrl.p_norms[k] for k in sorted(window)},
         "i_norms": {str(k): ctrl.i_norms[k] for k in sorted(window)},
         "d_norms": {str(k): ctrl.d_norms[k] for k in sorted(window)},
@@ -125,6 +143,18 @@ def main():
                         help="Proportional gain(s) to sweep (default: 1.0)")
     parser.add_argument("--ki", type=float, nargs="+", default=KI_GRID_DEFAULT,
                         help="Ki values to sweep")
+    parser.add_argument("--kd", type=float, default=0.0,
+                        help="Derivative gain (fixed across sweep, default: 0.0)")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Steering vector scale / alpha (default: 1.0)")
+    parser.add_argument("--sign", type=int, choices=[1, -1], default=1,
+                        help="Steering direction: 1=toward refusal, -1=away (sanity check)")
+    parser.add_argument("--attack", choices=ATTACK_NAMES, default="none",
+                        help="Attack to apply to prompts (default: none)")
+    parser.add_argument("--save-completions", metavar="TAG", default=None,
+                        help="Save (prompt, completion, is_jailbreak) JSONL per condition")
+    parser.add_argument("--tag", type=str, default="",
+                        help="Optional suffix for output filenames")
     args = parser.parse_args()
 
     n_test = args.n_test if args.n_test is not None else (10 if args.small else None)
@@ -140,7 +170,9 @@ def main():
     else:
         device = "cpu"
 
-    print(f"Device: {device} | n_test: {n_test or 'all'} | Kd={KD_FIXED} (fixed)")
+    sign_label = "REVERSE (sanity check)" if args.sign == -1 else "forward"
+    print(f"Device: {device} | n_test: {n_test or 'all'} | Kd={args.kd} | "
+          f"scale={args.scale} | sign={sign_label} | attack={args.attack}")
     print(f"Kp grid: {args.kp}")
     print(f"Ki grid: {args.ki}")
     print(f"Total conditions: {len(args.kp) * len(args.ki) * 2} (×2 for vanilla + AW)")
@@ -178,8 +210,11 @@ def main():
             print(f"Baseline per-layer PID ASR: {baseline_perlayer:.3f}")
 
     # Load data + Gemma
-    _, harmful_test, _, _ = load_data(n_test=n_test)
-    print(f"\nTest set: {len(harmful_test)} harmful prompts")
+    _, harmful_raw, _, _ = load_data(n_test=n_test)
+    harmful_test = apply_attack(harmful_raw, args.attack)
+    print(f"\nTest set: {len(harmful_test)} harmful prompts (attack={args.attack})")
+    if args.attack != "none":
+        print(f"  Example: {harmful_test[0][:120]}...")
     print("Loading Gemma-2-2B-it...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="left")
     if tokenizer.pad_token is None:
@@ -202,22 +237,24 @@ def main():
         kp_tag = f"kp{str(kp).replace('.', '')}"
         sweep_results = {}
         print(f"\n{'='*len(HDR)}")
-        print(f"Kp = {kp}  (Kd = {KD_FIXED})")
+        print(f"Kp = {kp}  (Kd = {args.kd}, scale = {args.scale})")
         print(HDR)
         print(SEP)
 
         for ki in args.ki:
             ki_tag = f"ki{str(ki).replace('.', '')}"
+            sub_tag_v = f"{args.save_completions}_{kp_tag}_{ki_tag}_vanilla" if args.save_completions else None
+            sub_tag_aw = f"{args.save_completions}_{kp_tag}_{ki_tag}_aw" if args.save_completions else None
 
             vanilla = run_condition(
-                "vanilla", GlobalPIDController, r_bar, kp, ki, KD_FIXED, window,
-                module_dict, model, tokenizer, harmful_test, batch_size, max_new_tokens, device,
-                ref_model, ref_tokenizer,
+                "vanilla", GlobalPIDController, r_bar, kp, ki, args.kd, args.scale, args.sign, window,
+                module_dict, model, tokenizer, harmful_test, harmful_raw, batch_size, max_new_tokens, device,
+                ref_model, ref_tokenizer, save_tag=sub_tag_v, attack=args.attack,
             )
             aw = run_condition(
-                "antiwindup", GlobalPIDControllerAntiWindup, r_bar, kp, ki, KD_FIXED, window,
-                module_dict, model, tokenizer, harmful_test, batch_size, max_new_tokens, device,
-                ref_model, ref_tokenizer,
+                "antiwindup", GlobalPIDControllerAntiWindup, r_bar, kp, ki, args.kd, args.scale, args.sign, window,
+                module_dict, model, tokenizer, harmful_test, harmful_raw, batch_size, max_new_tokens, device,
+                ref_model, ref_tokenizer, save_tag=sub_tag_aw, attack=args.attack,
             )
 
             sweep_results[ki_tag] = {"ki": ki, "global_pid": vanilla, "global_pid_antiwindup": aw}
@@ -235,10 +272,15 @@ def main():
                 f"  {v_deg:>5}/{aw_deg:<5}  {ratio:>8.3f}"
             )
 
-        all_sweep_results[kp_tag] = {"kp": kp, "kd": KD_FIXED, "ki_grid": args.ki,
+        all_sweep_results[kp_tag] = {"kp": kp, "kd": args.kd, "scale": args.scale,
+                                      "sign": args.sign, "attack": args.attack,
+                                      "ki_grid": args.ki,
                                       "window": window, "sweep": sweep_results}
 
-        out_path = RESULTS_DIR / f"sweep_{kp_tag}.json"
+        attack_tag = f"_{args.attack}" if args.attack != "none" else ""
+        sign_tag = "_reverse" if args.sign == -1 else ""
+        user_tag = f"_{args.tag}" if args.tag else ""
+        out_path = RESULTS_DIR / f"sweep_{kp_tag}{attack_tag}{sign_tag}{user_tag}.json"
         with open(out_path, "w") as f:
             json.dump(all_sweep_results[kp_tag], f, indent=2)
         print(f"\nSaved: {out_path}")
@@ -269,9 +311,11 @@ def main():
                        label=f"no steering ({baseline_no_steer:.3f})")
 
     ax_asr.set_ylabel("Attack Success Rate (ASR)")
+    sign_str = "REVERSE" if args.sign == -1 else "forward"
     ax_asr.set_title(
         f"ASR & PPL vs Ki — Global PID  |  {MODEL_ID}\n"
-        f"Kd={KD_FIXED}, scale=1.0, W={window[0]}–{window[-1]}  |  Run #{run_id:03d}"
+        f"Kd={args.kd}, scale={args.scale}, sign={sign_str}, attack={args.attack}, "
+        f"W={window[0]}–{window[-1]}  |  Run #{run_id:03d}"
     )
     ax_asr.legend(fontsize=8)
     ax_asr.grid(True, alpha=0.3)

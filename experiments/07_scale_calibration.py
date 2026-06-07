@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.attacks import ATTACK_NAMES, apply_attack
 from src.controllers import GlobalPIDController
 from src.data import load_data
 from src.hooks import add_hooks, get_actadd_output_hook, get_capture_output_hook
@@ -93,6 +94,12 @@ def main():
     parser.add_argument("--kp", type=float, default=0.9)
     parser.add_argument("--ki", type=float, default=0.01)
     parser.add_argument("--kd", type=float, default=0.01)
+    parser.add_argument("--sign", type=int, choices=[1, -1], default=1,
+                        help="Steering direction: 1=toward refusal, -1=away (sanity check)")
+    parser.add_argument("--attack", choices=ATTACK_NAMES, default="none",
+                        help="Attack to apply to probe prompts (default: none)")
+    parser.add_argument("--tag", type=str, default="",
+                        help="Optional suffix for output filenames")
     args = parser.parse_args()
 
     n_probe = args.n_probe if args.n_probe is not None else (4 if args.small else 16)
@@ -107,7 +114,9 @@ def main():
     else:
         device = "cpu"
 
-    print(f"Device: {device} | n_probe: {n_probe} | scales: {args.scales}")
+    sign_label = "REVERSE (sanity check)" if args.sign == -1 else "forward"
+    print(f"Device: {device} | n_probe: {n_probe} | scales: {args.scales} | "
+          f"attack={args.attack} sign={sign_label}")
 
     global_path = ARTIFACTS_DIR / "refusal_vector_global.pt"
     window_path = ARTIFACTS_DIR / "persistence_window.json"
@@ -125,9 +134,9 @@ def main():
 
     print(f"r_bar norm: {r_bar.norm():.4f}  |  Window W = {window[0]}–{window[-1]} ({len(window)} layers)")
 
-    _, harmful_test, _, _ = load_data(n_test=n_probe)
-    probes = harmful_test[:n_probe]
-    print(f"Probe set: {len(probes)} harmful prompts")
+    _, harmful_raw, _, _ = load_data(n_test=n_probe)
+    probes = apply_attack(harmful_raw[:n_probe], args.attack)
+    print(f"Probe set: {len(probes)} harmful prompts (attack={args.attack})")
 
     print("Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="left")
@@ -153,7 +162,7 @@ def main():
     scale_break = None
 
     for scale in sorted(args.scales):
-        ctrl = GlobalPIDController(r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window)
+        ctrl = GlobalPIDController(r_bar=r_bar, kp=args.kp, ki=args.ki, kd=args.kd, window=window, sign=args.sign)
         sdirs = ctrl.precompute_steering_dirs()
 
         steer_hooks = [
@@ -210,11 +219,15 @@ def main():
         "nosteer_final_norm": nosteer_final,
         "window": window,
         "kp": args.kp, "ki": args.ki, "kd": args.kd,
+        "sign": args.sign, "attack": args.attack,
         "n_probe": n_probe,
         "model": MODEL_ID,
         "sweep": sweep_results,
     }
-    json_path = RESULTS_DIR / "scale_calibration.json"
+    attack_tag = f"_{args.attack}" if args.attack != "none" else ""
+    sign_tag = "_reverse" if args.sign == -1 else ""
+    user_tag = f"_{args.tag}" if args.tag else ""
+    json_path = RESULTS_DIR / f"scale_calibration{attack_tag}{sign_tag}{user_tag}.json"
     with open(json_path, "w") as f:
         json.dump(out, f, indent=2)
     print(f"Saved: {json_path}")
@@ -261,7 +274,7 @@ def main():
     ax_bot.grid(True, axis="y", alpha=0.3)
 
     fig.tight_layout()
-    fig_path = FIGURES_DIR / "scale_calibration.png"
+    fig_path = FIGURES_DIR / f"scale_calibration{attack_tag}{sign_tag}{user_tag}.png"
     fig.savefig(fig_path, dpi=150)
     plt.close(fig)
     print(f"Saved: {fig_path}")

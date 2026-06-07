@@ -101,9 +101,13 @@ def main():
                         help="Steering vector scale / alpha (default: 1.0)")
     parser.add_argument("--attack", choices=ATTACK_NAMES, default="none",
                         help="Attack to apply to prompts (default: none)")
+    parser.add_argument("--sign", type=int, choices=[1, -1], default=1,
+                        help="Steering direction: 1=toward refusal, -1=away (sanity check)")
     parser.add_argument("--save-completions", metavar="TAG", default=None,
                         help="If set, save (prompt, completion, is_jailbreak) JSONL to "
                              "artifacts/completions/<TAG>_<condition>.jsonl")
+    parser.add_argument("--tag", type=str, default="",
+                        help="Optional suffix for output filenames")
     args = parser.parse_args()
 
     n_test = args.n_test if args.n_test is not None else (10 if args.small else None)
@@ -119,9 +123,10 @@ def main():
     else:
         device = "cpu"
 
+    sign_label = "REVERSE (sanity check)" if args.sign == -1 else "forward"
     print(f"Device: {device} | n_test: {n_test or 'all'} | "
           f"Kp={args.kp} Ki={args.ki} Kd={args.kd} scale={args.scale} | "
-          f"attack={args.attack} | model: {MODEL_ID}")
+          f"attack={args.attack} sign={sign_label} | model: {MODEL_ID}")
 
     per_layer_path = ARTIFACTS_DIR / "refusal_vectors_per_layer.pt"
     if not per_layer_path.exists():
@@ -165,8 +170,9 @@ def main():
         )
 
     # ── Condition 2: Per-layer PID steering ───────────────────────────────────
-    print("\n[2/2] Per-layer PID steering")
-    controller = PerLayerPIDController(ref_dirs, kp=args.kp, ki=args.ki, kd=args.kd)
+    cond_label = f"perlayer_pid{'_reverse' if args.sign == -1 else ''}"
+    print(f"\n[2/2] {cond_label}")
+    controller = PerLayerPIDController(ref_dirs, kp=args.kp, ki=args.ki, kd=args.kd, sign=args.sign)
     steering_dirs = controller.steering_dirs
 
     fwd_hooks_pid = [
@@ -182,24 +188,26 @@ def main():
         max_new_tokens=max_new_tokens, device=device
     )
     asr_pid = compute_asr(completions_pid)
-    results["perlayer_pid"] = {
-        **asr_pid, "attack": args.attack,
+    results[cond_label] = {
+        **asr_pid, "attack": args.attack, "sign": args.sign,
         "kp": args.kp, "ki": args.ki, "kd": args.kd, "scale": args.scale,
     }
-    print(f"  Per-layer PID ASR: {asr_pid['asr']:.3f} ({asr_pid['n_success']}/{asr_pid['n_total']})")
+    print(f"  {cond_label} ASR: {asr_pid['asr']:.3f} ({asr_pid['n_success']}/{asr_pid['n_total']})")
     if args.save_completions:
         save_completions(
-            COMPLETIONS_DIR / f"{args.save_completions}_perlayer_pid.jsonl",
+            COMPLETIONS_DIR / f"{args.save_completions}_{cond_label}.jsonl",
             harmful_raw, completions_pid,
         )
 
-    print(f"\nASR summary (attack={args.attack}):")
+    print(f"\nASR summary (attack={args.attack}, sign={sign_label}):")
     print(f"  No steering:   {results['no_steering']['asr']:.3f}")
-    print(f"  Per-layer PID: {results['perlayer_pid']['asr']:.3f}  "
+    print(f"  {cond_label}: {results[cond_label]['asr']:.3f}  "
           f"(Kp={args.kp}, Ki={args.ki}, Kd={args.kd}, scale={args.scale})")
 
     attack_tag = f"_{args.attack}" if args.attack != "none" else ""
-    out_path = RESULTS_DIR / f"baseline_perlayer_pid_asr{attack_tag}.json"
+    sign_tag = "_reverse" if args.sign == -1 else ""
+    user_tag = f"_{args.tag}" if args.tag else ""
+    out_path = RESULTS_DIR / f"baseline_perlayer_pid_asr{attack_tag}{sign_tag}{user_tag}.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved: {out_path}")

@@ -18,6 +18,8 @@ class PerLayerPIDController:
     Per-layer PID: pre-computes one steering direction per layer via PID
     recurrence over DIM directions. Directions are applied as static ActAdd
     during generation (no online update).
+
+    sign: 1 (default, toward refusal) or -1 (reverse, away — sanity check).
     """
 
     def __init__(
@@ -26,9 +28,12 @@ class PerLayerPIDController:
         kp: float = 0.9,
         ki: float = 0.01,
         kd: float = 0.01,
+        sign: int = 1,
     ):
         from src.dim import apply_pid_to_dirs
-        self.steering_dirs = apply_pid_to_dirs(ref_dirs, kp=kp, ki=ki, kd=kd)
+        self.sign = sign
+        dirs = apply_pid_to_dirs(ref_dirs, kp=kp, ki=ki, kd=kd)
+        self.steering_dirs = {k: v * sign for k, v in dirs.items()}
 
     def get_steering_dir(self, layer_idx: int) -> Tensor:
         return self.steering_dirs[layer_idx]
